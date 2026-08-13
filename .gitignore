@@ -77,3 +77,6 @@ software_host/physic_extraction.ipynb
 software_host/physics_extraction_V3.py
 software_host/physics_extraction_V2.py
 software_host/regression_Old.ipynb
+software_host/machine_learning/1d_cnn_old.ipynb
+1d_cnn_cascade.py
+1d_cnn_fixed.ipynb

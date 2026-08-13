@@ -2,11 +2,12 @@
 Serial communication manager for STM32-based EIS device.
 """
 
+import csv
 import serial
 import threading
 import time
 import logging
-from typing import Callable, Optional
+from typing import Callable, List, Optional, Tuple
 from queue import Queue, Empty
 
 logger = logging.getLogger(__name__)
@@ -155,6 +156,19 @@ import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
 
+def parse_line_values(line: str) -> Optional[List[float]]:
+    """
+    Parse a raw serial line (e.g. "0, 1306.478,-12.374,1306.478,-12.374")
+    into a list of floats, or None if the line isn't numeric (startup
+    banners, log text, etc.).
+    """
+    parts = line.split(",")
+    try:
+        return [float(p.strip()) for p in parts]
+    except ValueError:
+        return None
+
+
 class SerialReaderThread(QThread):
     """
     Real-time serial data reader thread.
@@ -231,12 +245,8 @@ class SerialReaderThread(QThread):
             # Emit raw line for console
             self.raw_line.emit(line)
 
-            parts = line.split(",")
-
-            # Try to parse as numbers
-            try:
-                values = [float(p.strip()) for p in parts]
-            except ValueError:
+            values = parse_line_values(line)
+            if values is None:
                 # Text line (startup messages etc.) – skip
                 continue
 
@@ -280,3 +290,119 @@ class SerialReaderThread(QThread):
         """Stop the reader thread."""
         self._running = False
         self.wait(2000)
+
+
+# ============================================================================
+# CSV Replay: rebuild sweeps/frames from a file exported by this GUI
+# ============================================================================
+#
+# Two export formats exist in the GUI (CleanMainWindow):
+#   - "Record" (RECORD button): header ["timestamp", "data"], where "data" is
+#     the raw serial line exactly as received from the STM32.
+#   - "Buffer" (SAVE/EXPORT button): header
+#     ["sweep", "idx", "mag", "phase", "acc_mag", "acc_phase"].
+#
+# load_recorded_csv() detects which one it's looking at and reconstructs the
+# same (M, 5) impedance-sweep / (N, 2) signal-frame arrays that
+# SerialReaderThread emits live, so old recordings can be replotted.
+
+def load_recorded_csv(filepath: str) -> Tuple[List["np.ndarray"], List["np.ndarray"]]:
+    """
+    Rebuild impedance sweeps (and signal frames, if any) from a previously
+    exported CSV file.
+
+    Returns:
+        (impedance_sweeps, signal_frames): lists of numpy arrays, in
+        chronological order. impedance_sweeps entries are (M, 5) arrays of
+        [idx, mag, phase, accMag, accPhase]; signal_frames entries are
+        (N, 2) arrays of [adc1, adc2].
+    """
+    with open(filepath, "r", newline="") as f:
+        reader = csv.reader(f)
+        try:
+            header = next(reader)
+        except StopIteration:
+            return [], []
+        rows = [row for row in reader if row]
+
+    header_norm = [h.strip().lower() for h in header]
+
+    if header_norm[:2] == ["sweep", "idx"]:
+        return _load_buffer_format_rows(rows), []
+
+    return _load_record_format_rows(rows)
+
+
+def _load_buffer_format_rows(rows: List[List[str]]) -> List["np.ndarray"]:
+    """Parse rows from the SAVE/EXPORT "buffer" CSV format."""
+    sweeps = {}
+    order = []
+    for row in rows:
+        if len(row) < 6:
+            continue
+        try:
+            sweep_id = int(float(row[0]))
+            values = [float(v) for v in row[1:6]]
+        except ValueError:
+            continue
+        if sweep_id not in sweeps:
+            sweeps[sweep_id] = []
+            order.append(sweep_id)
+        sweeps[sweep_id].append(values)
+
+    return [np.array(sweeps[sid]) for sid in order if sweeps[sid]]
+
+
+def _load_record_format_rows(
+    rows: List[List[str]],
+) -> Tuple[List["np.ndarray"], List["np.ndarray"]]:
+    """Parse rows from the RECORD "timestamp,data" raw-line CSV format."""
+    impedance_sweeps = []
+    signal_frames = []
+
+    impedance_buf = []
+    signal_buf = []
+    current_mode = None
+
+    for row in rows:
+        if len(row) < 2:
+            continue
+        values = parse_line_values(row[1])
+        if values is None:
+            continue
+
+        n_fields = len(values)
+
+        if n_fields == 2:
+            if current_mode != "signal":
+                current_mode = "signal"
+                if impedance_buf:
+                    impedance_sweeps.append(np.array(impedance_buf))
+                    impedance_buf = []
+            signal_buf.append(values)
+            if len(signal_buf) >= 2048:
+                signal_frames.append(np.array(signal_buf[:2048]))
+                signal_buf = []
+
+        elif n_fields == 5:
+            if current_mode != "impedance":
+                current_mode = "impedance"
+                if signal_buf:
+                    signal_frames.append(np.array(signal_buf))
+                    signal_buf = []
+
+            idx = int(values[0])
+            if idx == 0 and impedance_buf:
+                impedance_sweeps.append(np.array(impedance_buf))
+                impedance_buf = []
+            impedance_buf.append(values)
+
+    # Unlike the live reader, there's no "next sweep" coming to trigger a
+    # final flush - save whatever is left in the buffers so the last
+    # (possibly partial) sweep/frame in the file isn't lost.
+    if impedance_buf:
+        impedance_sweeps.append(np.array(impedance_buf))
+    if signal_buf:
+        signal_frames.append(np.array(signal_buf))
+
+    return impedance_sweeps, signal_frames

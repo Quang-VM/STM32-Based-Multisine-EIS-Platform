@@ -7,6 +7,7 @@ import sys
 import logging
 import csv
 import datetime
+from pathlib import Path
 from typing import Optional
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
@@ -18,7 +19,7 @@ from PyQt6.QtGui import QFont
 
 import serial.tools.list_ports
 
-from data_acquisition.serial_manager import SerialReaderThread
+from data_acquisition.serial_manager import SerialReaderThread, load_recorded_csv
 from gui.enhanced_plots import EnhancedPlotManager
 from utils.data_storage import DataStorage
 from config.settings import SERIAL_CONFIG, PLOT_CONFIG, GUI_CONFIG
@@ -232,6 +233,18 @@ class CleanMainWindow(QMainWindow):
         data_row2.addWidget(self.export_btn, 1)
 
         data_layout.addLayout(data_row2)
+
+        data_row3 = QHBoxLayout()
+        self.load_btn = QPushButton("📂 LOAD CSV (Replot)")
+        self.load_btn.setMinimumHeight(38)
+        self.load_btn.setToolTip(
+            "Load a previously exported CSV (RECORD or SAVE/EXPORT format) "
+            "and redraw the Nyquist/Bode plots from it."
+        )
+        self.load_btn.clicked.connect(self.on_load_csv)
+        data_row3.addWidget(self.load_btn, 1)
+        data_layout.addLayout(data_row3)
+
         data_group.setLayout(data_layout)
         left_layout.addWidget(data_group)
 
@@ -544,6 +557,77 @@ class CleanMainWindow(QMainWindow):
     def on_export_data(self):
         """Export data."""
         self.on_save_buffer()
+
+    def on_load_csv(self):
+        """
+        Load a previously exported CSV (RECORD "timestamp,data" format, or
+        SAVE/EXPORT "sweep,idx,mag,phase,acc_mag,acc_phase" format) and
+        redraw the Nyquist/Bode plots from it, so old measurements can be
+        screenshotted for the report.
+        """
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Recorded Data", "", "CSV Files (*.csv);;All Files (*)"
+        )
+        if not path:
+            return
+
+        if self.serial_reader is not None:
+            reply = QMessageBox.question(
+                self,
+                "Serial device connected",
+                "A serial device is currently connected. Loading a file will "
+                "clear the current buffers, and any new live data may "
+                "overwrite the loaded plot. Continue anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        try:
+            impedance_sweeps, signal_frames = load_recorded_csv(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Load failed", f"Could not parse {path}:\n{e}")
+            self.console.append(f"✗ Failed to load {path}: {e}")
+            return
+
+        if not impedance_sweeps and not signal_frames:
+            QMessageBox.warning(
+                self,
+                "No data found",
+                "No recognizable impedance or signal data was found in this file.",
+            )
+            return
+
+        self.plot_manager.clear_buffers()
+
+        for sweep in impedance_sweeps:
+            self.plot_manager.add_impedance_sweep(sweep)
+        for frame in signal_frames:
+            self.plot_manager.add_signal_frame(frame)
+
+        self.measurement_count = len(impedance_sweeps)
+        self.measurement_lbl.setText(f"Measurements: {self.measurement_count}")
+        self.sweeps_lbl.setText(f"Sweeps: {len(self.plot_manager.impedance_history)}")
+        if impedance_sweeps:
+            self.points_lbl.setText(f"Points: {impedance_sweeps[-1].shape[0]}")
+
+        # Switch to a plot type that matches the data we actually loaded.
+        if impedance_sweeps and self.plot_type.currentText() == "Time Domain":
+            self.plot_type.setCurrentText("Nyquist")
+        elif signal_frames and not impedance_sweeps and self.plot_type.currentText() != "Time Domain":
+            self.plot_type.setCurrentText("Time Domain")
+
+        # Make sure the plot isn't paused so the loaded data actually shows.
+        self.pause_btn.setChecked(False)
+        self.pause_btn.setText("⏸ PAUSE")
+        self.pause_btn.setStyleSheet("")
+        self.on_replot()
+
+        self.console.append(
+            f"✓ Loaded {len(impedance_sweeps)} sweep(s) / "
+            f"{len(signal_frames)} signal frame(s) from {path}"
+        )
+        self.statusBar().showMessage(f"Loaded {Path(path).name}")
 
     def on_clear_console(self):
         """Clear console."""
