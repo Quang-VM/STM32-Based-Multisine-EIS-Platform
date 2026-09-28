@@ -1,1 +1,1 @@
-# mini-belt-characterization
+# STM32-Based Multisine EIS Platform for Equivalent Circuit Parameter Estimation
